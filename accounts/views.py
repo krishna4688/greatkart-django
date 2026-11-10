@@ -17,6 +17,11 @@ from django.core.mail import EmailMessage
 
 from django.utils.encoding import force_str
 
+from cart.views import _cart_id
+from cart.models import CartItem,Cart
+
+import requests
+
 @ensure_csrf_cookie
 def register(request):
     if request.method == 'POST':
@@ -60,20 +65,95 @@ def register(request):
     }
     return render(request, 'accounts/register.html',context)
 
+
 def login(request):
     if request.method == 'POST':
         email = request.POST['email']
         password = request.POST['password']
 
+        # Get guest cart before login
+        old_cart_id = _cart_id(request)
+
+        try:
+            guest_cart = Cart.objects.get(cart_id=old_cart_id)
+            guest_cart_items = list(
+                CartItem.objects.filter(cart=guest_cart)
+            )
+
+        except Cart.DoesNotExist:
+            guest_cart = None
+            guest_cart_items = []
+
+        # Authenticate user
         user = auth.authenticate(email=email, password=password)
 
         if user is not None:
-            auth.login(request,user)
+
+            # Login user
+            auth.login(request, user)
+
+            # Merge guest cart with user's existing cart
+            if guest_cart:
+
+                for guest_item in guest_cart_items:
+
+                    guest_variations = set(
+                        guest_item.variation.values_list('id', flat=True)
+                    )
+
+                    user_cart_items = CartItem.objects.filter(
+                        user=user,
+                        product=guest_item.product
+                    ).exclude(id=guest_item.id)
+
+                    matching_item = None
+
+                    for existing_item in user_cart_items:
+
+                        existing_variations = set(
+                            existing_item.variation.values_list('id', flat=True)
+                        )
+
+                        if guest_variations == existing_variations:
+                            matching_item = existing_item
+                            break
+
+                    if matching_item:
+                        matching_item.quantity += guest_item.quantity
+                        matching_item.save()
+                        guest_item.delete()
+
+                    else:
+                        guest_item.user = user
+                        guest_item.save()
+
+                # Update cart session ID
+                guest_cart.cart_id = _cart_id(request)
+                guest_cart.save()
+
             messages.success(request, 'You are now logged in.')
+
+            # Redirect to previous page using requests
+            try:
+                url = request.META.get('HTTP_REFERER')
+                query = requests.utils.urlparse(url).query
+                params = dict(
+                    x.split('=') for x in query.split('&')
+                )
+
+                if 'next' in params:
+                    nextPage = params['next']
+                    return redirect(nextPage)
+
+            except (TypeError, ValueError, AttributeError):
+                pass
+
             return redirect('dashboard')
+
         else:
-            messages.error(request,'Invalid login credentials')
+            messages.error(request, 'Invalid login credentials')
             return redirect('login')
+
     return render(request, 'accounts/login.html')
 
 
